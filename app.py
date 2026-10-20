@@ -1,33 +1,69 @@
 import streamlit as st
 import pandas as pd
 import requests
+import datetime
 
-# Page settings
-st.set_page_config(page_title="Cloud Algo Terminal", layout="wide", page_icon="⚡")
+# --- PAGE CONFIG ---
+st.set_page_config(page_title="Autonomous Algo Terminal", layout="wide", page_icon="⚡")
 
-# --- SECRETS OR SIDEBAR INPUT ---
+# --- CREDENTIALS ---
 st.sidebar.header("🔑 Credentials")
-dhan_client_id = st.secrets.get("DHAN_CLIENT_ID", "") or st.sidebar.text_input("Dhan Client ID", type="password")
-dhan_access_token = st.secrets.get("DHAN_ACCESS_TOKEN", "") or st.sidebar.text_input("Dhan Access Token", type="password")
-bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN", "") or st.sidebar.text_input("Telegram Bot Token", type="password")
-chat_id = st.secrets.get("TELEGRAM_CHAT_ID", "") or st.sidebar.text_input("Telegram Chat ID")
+dhan_client_id = st.sidebar.text_input("Dhan Client ID", type="password")
+dhan_access_token = st.sidebar.text_input("Dhan Access Token", type="password")
+bot_token = st.sidebar.text_input("Telegram Bot Token", type="password")
+chat_id = st.sidebar.text_input("Telegram Chat ID")
 
-# --- FUNCTION: DISPATCH TELEGRAM ALERT WITH BUTTONS ---
+# --- 1. STRATEGY ENGINE (9 EMA & 21 EMA CROSSOVER) ---
+def evaluate_strategy(df):
+    """
+    df must have: 'close', 'low', 'high'
+    Returns: Signal (BUY/SELL/HOLD), Entry, SL, TGT
+    """
+    # Calculate Indicators in pure Pandas
+    df['EMA_9'] = df['close'].ewm(span=9, adjust=False).mean()
+    df['EMA_21'] = df['close'].ewm(span=21, adjust=False).mean()
+
+    # Get latest two candles
+    prev_candle = df.iloc[-2]
+    curr_candle = df.iloc[-1]
+
+    signal = "HOLD"
+    entry = curr_candle['close']
+    sl = 0
+    tgt = 0
+
+    # Bullish Crossover: 9 EMA crosses above 21 EMA
+    if prev_candle['EMA_9'] <= prev_candle['EMA_21'] and curr_candle['EMA_9'] > curr_candle['EMA_21']:
+        signal = "BUY"
+        sl = round(curr_candle['low'] - 10, 2)  # SL 10 pts below candle low
+        risk = entry - sl
+        tgt = round(entry + (risk * 2), 2)     # 1:2 Risk to Reward
+
+    # Bearish Crossover: 9 EMA crosses below 21 EMA
+    elif prev_candle['EMA_9'] >= prev_candle['EMA_21'] and curr_candle['EMA_9'] < curr_candle['EMA_21']:
+        signal = "SELL"
+        sl = round(curr_candle['high'] + 10, 2) # SL 10 pts above candle high
+        risk = sl - entry
+        tgt = round(entry - (risk * 2), 2)     # 1:2 Risk to Reward
+
+    return signal, entry, sl, tgt
+
+# --- 2. SEND ALERT TO TELEGRAM ---
 def send_telegram_alert(symbol, sec_id, action, entry, sl, tgt, qty):
     if not bot_token or not chat_id:
-        st.error("Please provide your Telegram Bot Token and Chat ID!")
+        st.error("Please provide Telegram details in the sidebar!")
         return
-    
+
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     text = (
-        f"🚨 <b>AUTONOMOUS SIGNAL DETECTED</b> 🚨\n\n"
+        f"🚨 <b>{action} SIGNAL TRIGGERED</b> 🚨\n\n"
         f"<b>Asset:</b> {symbol}\n"
-        f"<b>Action:</b> {action}\n"
+        f"<b>Strategy:</b> EMA 9/21 Crossover\n"
         f"<b>Entry:</b> ₹{entry}\n"
         f"<b>Stop Loss:</b> ₹{sl}\n"
-        f"<b>Target:</b> ₹{tgt}\n"
-        f"<b>Qty:</b> {qty}\n\n"
-        f"<i>Tap below to take action on Dhan:</i>"
+        f"<b>Target (1:2):</b> ₹{tgt}\n"
+        f"<b>Quantity:</b> {qty}\n\n"
+        f"<i>Tap below to execute directly in Dhan:</i>"
     )
     payload = {
         "chat_id": chat_id,
@@ -36,22 +72,19 @@ def send_telegram_alert(symbol, sec_id, action, entry, sl, tgt, qty):
         "reply_markup": {
             "inline_keyboard": [
                 [
-                    {"text": "🎯 CATCH (Execute Trade)", "callback_data": f"CATCH_{sec_id}_{action}_{qty}"},
+                    {"text": "🎯 CATCH (Trade Now)", "callback_data": f"CATCH_{sec_id}_{action}_{qty}"},
                     {"text": "❌ IGNORE", "callback_data": "IGNORE"}
                 ]
             ]
         }
     }
     try:
-        r = requests.post(url, json=payload)
-        if r.status_code == 200:
-            st.success(f"Signal sent to Telegram for {symbol}!")
-        else:
-            st.error(f"Telegram error: {r.text}")
+        requests.post(url, json=payload)
+        st.success(f"Alert sent for {symbol}!")
     except Exception as e:
-        st.error(f"Error: {e}")
+        st.error(f"Telegram error: {e}")
 
-# --- FUNCTION: DHAN ORDER EXECUTION ---
+# --- 3. EXECUTE DHAN ORDER ---
 def place_order(sec_id, action, qty):
     try:
         from dhanhq import dhanhq
@@ -70,8 +103,8 @@ def place_order(sec_id, action, qty):
     except Exception as e:
         return {"status": "failed", "error": str(e)}
 
-# --- CHECK FOR CATCH CLICKS FROM TELEGRAM ---
-def check_for_catch():
+# --- 4. TELEGRAM BUTTON LISTENER ---
+def process_telegram_clicks():
     if not bot_token:
         return
     url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
@@ -81,52 +114,50 @@ def check_for_catch():
             if "callback_query" in update:
                 query = update["callback_query"]
                 data = query.get("data", "")
-                query_id = query.get("id")
+                q_id = query.get("id")
                 
                 if data.startswith("CATCH"):
                     _, s_id, side, q = data.split("_")
                     order_res = place_order(s_id, side, q)
-                    
-                    # Notify on Telegram that trade is executed
-                    requests.post(f"https://api.telegram.org/bot{bot_token}/answerCallbackQuery", json={"callback_query_id": query_id, "text": "Trade placed on Dhan!"})
-                    requests.post(f"https://api.telegram.org/bot{bot_token}/sendMessage", json={"chat_id": chat_id, "text": f"⚡ <b>Order Executed!</b>\nResponse: {order_res}", "parse_mode": "HTML"})
+                    requests.post(f"https://api.telegram.org/bot{bot_token}/answerCallbackQuery", json={"callback_query_id": q_id, "text": "Fired in Dhan!"})
+                    requests.post(f"https://api.telegram.org/bot{bot_token}/sendMessage", json={"chat_id": chat_id, "text": f"✅ <b>Order Placed on Dhan!</b>\n{order_res}", "parse_mode": "HTML"})
                 elif data == "IGNORE":
-                    requests.post(f"https://api.telegram.org/bot{bot_token}/answerCallbackQuery", json={"callback_query_id": query_id, "text": "Signal Ignored."})
+                    requests.post(f"https://api.telegram.org/bot{bot_token}/answerCallbackQuery", json={"callback_query_id": q_id, "text": "Trade Ignored."})
     except Exception:
         pass
 
 # --- UI DASHBOARD ---
-st.title("⚡ Autonomous F&O Algo Terminal")
-st.caption("Powered by Dhan API & Telegram")
+st.title("⚡ Strategy Screener & Telegram Radar")
 
-tab1, tab2 = st.tabs(["🔍 Screener & Alert Radar", "⚡ Manual Trigger"])
+# Watchlist to scan
+watchlist = [
+    {"Symbol": "NIFTY 24500 CE", "Security_ID": "49081", "Qty": 25},
+    {"Symbol": "BANKNIFTY 52000 PE", "Security_ID": "49082", "Qty": 15}
+]
 
-with tab1:
-    st.subheader("Live Market Signals")
-    
-    # Sample signals detected by rules
-    signals = [
-        {"Symbol": "NIFTY 24500 CE", "Security_ID": "49081", "Action": "BUY", "Entry": 145, "SL": 125, "TGT": 185, "Qty": 25},
-        {"Symbol": "BANKNIFTY 52200 PE", "Security_ID": "49082", "Action": "BUY", "Entry": 210, "SL": 180, "TGT": 270, "Qty": 15}
-    ]
-    st.dataframe(pd.DataFrame(signals), use_container_width=True)
+# Time Window Condition
+now = datetime.datetime.now().time()
+market_open = datetime.time(9, 15)
+market_close = datetime.time(15, 30)
 
-    if st.button("🚀 Run Scan & Send Signals to Telegram"):
-        for s in signals:
-            send_telegram_alert(s["Symbol"], s["Security_ID"], s["Action"], s["Entry"], s["SL"], s["TGT"], s["Qty"])
+st.write(f"Current Server Time: `{now.strftime('%H:%M:%S')}`")
 
-with tab2:
-    st.subheader("Direct Dhan Fire")
-    col1, col2 = st.columns(2)
-    with col1:
-        s_id = st.text_input("Security ID", value="49081")
-        trade_side = st.selectbox("Side", ["BUY", "SELL"])
-    with col2:
-        trade_qty = st.number_input("Quantity", value=25, step=25)
-    
-    if st.button("Place Test Market Order"):
-        res = place_order(s_id, trade_side, trade_qty)
-        st.write(res)
+if st.button("🔍 Scan Watchlist for Strategy Signals"):
+    for item in watchlist:
+        # Sample price data (In live trading, this comes from Dhan historical data)
+        sample_df = pd.DataFrame({
+            'close': [140, 142, 141, 145, 148, 152],
+            'low': [138, 140, 139, 143, 146, 150],
+            'high': [142, 144, 143, 147, 150, 154]
+        })
+        
+        sig, entry, sl, tgt = evaluate_strategy(sample_df)
+        
+        if sig in ["BUY", "SELL"]:
+            st.info(f"Signal found on **{item['Symbol']}**: `{sig}` at ₹{entry} | SL: ₹{sl} | TGT: ₹{tgt}")
+            send_telegram_alert(item['Symbol'], item['Security_ID'], sig, entry, sl, tgt, item['Qty'])
+        else:
+            st.write(f"{item['Symbol']}: No crossover condition met (HOLD).")
 
-# Process any pending button clicks from Telegram
-check_for_catch()
+# Check if you tapped CATCH
+process_telegram_clicks()
