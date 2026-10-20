@@ -1,0 +1,6 @@
+streamlit
+dhanhq
+pandas
+pandas-ta
+requests
+plotly
